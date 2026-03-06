@@ -13,7 +13,7 @@ export class GeminiScraperService {
     console.log("🔹 Initializing Chrome options");
 
     this.browser = await puppeteer.launch({
-      headless: true,
+      headless: false, // Change to false for debugging
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -35,10 +35,13 @@ export class GeminiScraperService {
     console.log("🌐 Opening Gemini page");
 
     await this.page.goto(GEMINI_URL, {
-      waitUntil: "domcontentloaded",
+      waitUntil: "networkidle2", // Changed from domcontentloaded
       timeout: 60000
     });
 
+    // Wait for page to fully load
+    await this.page.waitForTimeout(5000);
+    
     console.log("✅ Gemini page loaded");
   }
 
@@ -85,52 +88,97 @@ export class GeminiScraperService {
       console.warn("⚠️ JSON block regex failed");
     }
 
-    // Weakness array fallback regex
-    try {
-
-      const weaknessPattern = /"weaknesses":\s*(\[.*?\])/s;
-      const match = text.match(weaknessPattern);
-
-      if (match) {
-        console.log("⚠️ Weakness array detected via fallback regex");
-      }
-
-    } catch {}
-
     return null;
   }
 
   // ---------------- RESPONSE WAIT ----------------
-  async waitForCompleteResponse(element: ElementHandle<Element>) {
+  async waitForCompleteResponse() {
 
     if (!this.page) throw new Error("Page not initialized");
 
     console.log("⏳ Waiting for Gemini streaming response");
 
-    let prevText = "";
+    // Try multiple selectors for response
+    const responseSelectors = [
+      "div.markdown.markdown-main-panel",
+      "message-content .markdown",
+      ".response-content .markdown",
+      "div[data-test-id='response-content']"
+    ];
 
-    for (let i = 0; i < 40; i++) {
+    let responseElement: ElementHandle<Element> | null = null;
+    
+    // Find response element with any selector
+    for (const selector of responseSelectors) {
+      try {
+        await this.page.waitForSelector(selector, { timeout: 5000 });
+        responseElement = await this.page.$(selector);
+        if (responseElement) {
+          console.log(`✅ Found response with selector: ${selector}`);
+          break;
+        }
+      } catch {
+        console.log(`⚠️ Selector not found: ${selector}`);
+      }
+    }
+
+    if (!responseElement) {
+      // Try to find any element that might contain the response
+      console.log("🔍 Searching for any element with response content...");
+      
+      responseElement = await this.page.$("div[class*='markdown'], div[class*='response'], message-content");
+    }
+
+    if (!responseElement) {
+      throw new Error("Could not find response element");
+    }
+
+    // Wait for content to appear
+    let prevText = "";
+    let emptyCount = 0;
+    
+    for (let i = 0; i < 60; i++) { // Increased timeout
 
       const currentText: string = await this.page.evaluate(
         el => (el.textContent || "").trim(),
-        element
+        responseElement
       );
 
-      if (currentText === prevText && currentText.length > 50) {
+      if (currentText.length === 0) {
+        emptyCount++;
+        if (emptyCount > 10) {
+          console.log("⚠️ Response element is empty, checking if response is elsewhere...");
+          // Try to find if response moved to a different element
+          const allText = await this.page.evaluate(() => document.body.innerText);
+          if (allText.includes("overallSentiment") || allText.includes("strengths")) {
+            console.log("✅ Found JSON in page body");
+            return allText;
+          }
+        }
+      }
 
+      if (currentText.length > 0 && currentText !== prevText) {
+        console.log(`📝 Response length: ${currentText.length} characters`);
+        prevText = currentText;
+      }
+
+      if (currentText === prevText && currentText.length > 100) {
         console.log("✅ Gemini response stabilized");
-
         return currentText;
       }
 
-      prevText = currentText;
-
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await this.page.waitForTimeout(1000);
     }
 
     console.warn("⚠️ Response stabilization timeout");
-
-    return prevText;
+    
+    // Final attempt to get any text
+    const finalText = await this.page.evaluate(() => {
+      const elements = document.querySelectorAll('.markdown, message-content, [class*="response"]');
+      return Array.from(elements).map(el => el.textContent).join(' ');
+    });
+    
+    return finalText || prevText;
   }
 
   // ---------------- MAIN SERVICE ----------------
@@ -167,61 +215,95 @@ Return ONLY JSON object.
 
       console.log("🔍 Locating Gemini input field");
 
-      await this.page.waitForSelector(
+      // Multiple input selectors
+      const inputSelectors = [
+        "rich-textarea div[contenteditable='true']",
+        "[data-placeholder='Ask Gemini 3']",
+        "[data-placeholder='Ask Gemini']",
         "div[contenteditable='true']",
-        { timeout: 30000 }
-      );
+        ".ql-editor[contenteditable='true']"
+      ];
 
-      const inputField = await this.page.$("div[contenteditable='true']");
+      let inputField: ElementHandle<Element> | null = null;
+      
+      for (const selector of inputSelectors) {
+        try {
+          await this.page.waitForSelector(selector, { timeout: 5000 });
+          inputField = await this.page.$(selector);
+          if (inputField) {
+            console.log(`✅ Input field found with selector: ${selector}`);
+            break;
+          }
+        } catch {
+          console.log(`⚠️ Input selector not found: ${selector}`);
+        }
+      }
 
-      if (!inputField) throw new Error("Input field not found");
+      if (!inputField) {
+        throw new Error("Input field not found with any selector");
+      }
 
-      console.log("✅ Input field found");
-
-      await inputField.click();
-
-      console.log("✏️ Injecting prompt");
-
-      await this.page.evaluate(
-        (el, text) => {
-          (el as HTMLElement).innerText = text;
-        },
-        inputField,
-        question
-      );
-
+      // Clear any existing text
+      await inputField.click({ clickCount: 3 }); // Select all
+      await inputField.press("Backspace");
+      
+      // Type the question
+      console.log("✏️ Typing prompt");
+      await inputField.type(question, { delay: 10 });
+      
+      // Wait a bit before submitting
+      await this.page.waitForTimeout(2000);
+      
+      // Try multiple submission methods
       console.log("📨 Submitting prompt");
-
+      
+      // Method 1: Enter key
       await inputField.press("Enter");
+      
+      // Method 2: Look for send button (if Enter doesn't work)
+      await this.page.waitForTimeout(1000);
+      
+      const sendButton = await this.page.$("button[aria-label='Send message'], .send-button");
+      if (sendButton) {
+        const isDisabled = await this.page.evaluate(btn => (btn as HTMLButtonElement).disabled, sendButton);
+        if (!isDisabled) {
+          console.log("📨 Clicking send button");
+          await sendButton.click();
+        }
+      }
 
-      console.log("⏳ Waiting for Gemini response element");
+      console.log("⏳ Waiting for Gemini response...");
+      
+      // Wait for response to start generating
+      await this.page.waitForTimeout(3000);
 
-      await this.page.waitForSelector(
-        "div.markdown.markdown-main-panel",
-        { timeout: 60000 }
-      );
-
-      const responses = await this.page.$$(
-        "div.markdown.markdown-main-panel"
-      );
-
-      const responseElement = responses[responses.length - 1];
-
-      console.log("📥 Response element detected");
-
-      const responseText =
-        await this.waitForCompleteResponse(responseElement);
+      // Get the response text
+      const responseText = await this.waitForCompleteResponse();
 
       console.log("📝 Gemini raw response:");
-      console.log(responseText.substring(0, 500));
+      console.log(responseText.substring(0, 500) + "...");
+
+      if (!responseText || responseText.length < 10) {
+        console.log("⚠️ Response is empty, checking page content...");
+        
+        // Debug: Get all text from the page
+        const pageText = await this.page.evaluate(() => document.body.innerText);
+        console.log("📄 Page text length:", pageText.length);
+        
+        if (pageText.includes("overallSentiment") || pageText.includes("strengths")) {
+          console.log("✅ Found JSON in page text");
+          const parsedJson = this.extractCompleteJson(pageText);
+          if (parsedJson) {
+            return parsedJson;
+          }
+        }
+      }
 
       const parsedJson = this.extractCompleteJson(responseText);
 
       if (parsedJson) {
 
-        const elapsed =
-          ((Date.now() - startTime) / 1000).toFixed(2);
-
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
         console.log(`🎉 Analysis completed in ${elapsed}s`);
 
         return parsedJson;
@@ -229,19 +311,29 @@ Return ONLY JSON object.
 
       console.error("❌ JSON parsing failed");
 
+      // Take screenshot for debugging
+      await this.page.screenshot({ path: 'debug-screenshot.png' });
+      console.log("📸 Debug screenshot saved as debug-screenshot.png");
+
       return {
         status: "error",
         message: "Could not parse Gemini response",
-        raw: responseText
+        raw: responseText.substring(0, 1000)
       };
 
     } catch (error) {
 
-      console.error("❌ Gemini response timeout:", error);
+      console.error("❌ Error:", error);
+      
+      // Take screenshot on error
+      if (this.page) {
+        await this.page.screenshot({ path: 'error-screenshot.png' });
+        console.log("📸 Error screenshot saved as error-screenshot.png");
+      }
 
       return {
         status: "error",
-        message: "Gemini response timeout"
+        message: error instanceof Error ? error.message : "Unknown error"
       };
     }
   }
